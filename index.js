@@ -25,6 +25,10 @@ export const inject = ['tools', 'subprocess']
 
 const HELPER = fileURLToPath(new URL('./lib/apply.mjs', import.meta.url))
 const require = createRequire(import.meta.url)
+// The version is reported on every call so "is the harness running the new
+// build?" is answerable without guessing.
+const VERSION = require('./package.json').version
+
 
 /** Code files worth putting breakpoints in. */
 const CODE_EXTENSIONS = new Set([
@@ -119,6 +123,7 @@ const PARAMETERS = {
 const OUTPUT_SCHEMA = {
   type: 'object',
   properties: {
+    version: { type: 'string', description: 'Plugin version, so a stale install is obvious.' },
     action: { type: 'string', enum: ['set', 'list', 'clear'] },
     project: { type: 'string', description: 'Project directory the breakpoints belong to.' },
     storage: { type: 'string', description: 'VS Code workspace-state directory that was used.' },
@@ -144,7 +149,7 @@ const OUTPUT_SCHEMA = {
     backup: { type: 'string', description: 'Path of the state.vscdb backup taken before writing.' },
     notes: { type: 'array', items: { type: 'string' }, description: 'Warnings and skipped files.' },
   },
-  required: ['action', 'project', 'storage', 'base', 'total', 'files', 'applied', 'killed', 'relaunched', 'dryRun', 'backup', 'notes'],
+  required: ['version', 'action', 'project', 'storage', 'base', 'total', 'files', 'applied', 'killed', 'relaunched', 'dryRun', 'backup', 'notes'],
   additionalProperties: false,
 }
 
@@ -692,7 +697,7 @@ function groupByFile(entries, root) {
 }
 
 function renderResult(value) {
-  const facts = [`vscode · ${value.action}`, `${value.total} 个断点`]
+  const facts = [`vscode 断点 v${value.version}`, value.action, `${value.total} 个断点`]
   if (value.killed) facts.push('已结束原窗口')
   if (value.relaunched > 0) facts.push(`重开 ${value.relaunched} 个窗口`)
   if (value.dryRun) facts.push('dry-run（未写入）')
@@ -737,6 +742,7 @@ export function apply(ctx, config) {
         if (action === 'list') {
           const existing = readBreakpoints(storage.db)
           return {
+            version: VERSION,
             action,
             project,
             storage: storage.dir,
@@ -790,6 +796,7 @@ export function apply(ctx, config) {
 
         if (dryRun) {
           return {
+            version: VERSION,
             action,
             project,
             storage: storage.dir,
@@ -834,6 +841,7 @@ export function apply(ctx, config) {
         if (typeof status.reason === 'string' && status.reason !== '') notes.push(status.reason)
 
         return {
+          version: VERSION,
           action,
           project,
           storage: storage.dir,
