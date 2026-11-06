@@ -34,9 +34,12 @@ const CODE_EXTENSIONS = new Set([
   '.go', '.rs', '.java', '.kt', '.cs', '.rb', '.php', '.sh', '.lua',
 ])
 
-/** How to recognise the editor's own processes (never matches unrelated `code`). */
-const EDITOR_PATTERN =
-  '(?:/usr/share/code/code|/snap/code/|/opt/visual-studio-code|code-insiders|VSCodium|vscodium|/usr/share/code-insiders)'
+/**
+ * How to recognise the editor's own processes (never matches unrelated `code`
+ * such as `opencode`). Plain POSIX extended regex: `pgrep -f` rejects `(?:...)`.
+ */
+export const EDITOR_PATTERN =
+  '/usr/share/code/code|/snap/code/|/opt/visual-studio-code|/usr/share/code-insiders|code-insiders|VSCodium|vscodium'
 
 /** First line of a top-level block, used for files that are new in this branch. */
 const SEGMENT_RE = /^\s*(?:export\s+)?(?:async\s+def|def|class|function|func|struct|impl|namespace|template\s*<)\b/
@@ -456,12 +459,18 @@ async function resolveEditorBin(ctx) {
   return undefined
 }
 
-/** true/false, or undefined when the platform cannot tell us. */
+/**
+ * true / false, or undefined when this system cannot tell us. Only a clean
+ * "no match" (exit 1) may be reported as false: treating a pgrep error as
+ * "not running" would make the write silently useless.
+ */
 function editorRunning(pattern) {
   if (process.platform === 'win32') return undefined
   const out = spawnSync('pgrep', ['-f', pattern], { encoding: 'utf8' })
-  if (out.error !== undefined || out.status === 127) return undefined
-  return out.status === 0
+  if (out.error !== undefined) return undefined
+  if (out.status === 0) return true
+  if (out.status === 1) return false
+  return undefined
 }
 
 /** Windows that were open, so the relaunch puts the user back where they were. */
@@ -596,6 +605,12 @@ export function apply(ctx, config) {
 
         const running = editorRunning(cfg.editorPattern)
         const restart = args?.restart !== false
+        if (running === undefined) {
+          throw new Error(
+            'vscode_breakpoints: 无法判断 VS Code 是否在运行（这台机器没有可用的 pgrep，或正则被拒）。' +
+              '为避免写进去的断点被运行中的编辑器覆盖：先手动退出 VS Code，再带 restart=false 重试。',
+          )
+        }
         if (running === true && !restart) {
           throw new Error(
             'vscode_breakpoints: VS Code is running and restart=false, so the write would be discarded when it exits. ' +

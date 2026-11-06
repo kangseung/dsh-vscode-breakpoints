@@ -68,7 +68,7 @@ Steps 1–4 run in a **detached helper** (`lib/apply.mjs`), so if DSH itself run
 ## Known limits
 
 - `debug.breakpoint` / `__$__targetStorageMarker` are not public API; a major VS Code upgrade may change the format. `action=list` fails loudly rather than guessing.
-- On Windows the running state cannot be detected (no `pgrep`), so the tool writes without stopping the editor — close it yourself first.
+- On Windows the running state cannot be detected (no `pgrep`): the tool then refuses and asks for `restart=false` rather than writing blind, since a running editor would overwrite the result.
 - Single-folder workspaces and multi-root `.code-workspace` files that include the project are supported; anything else is not.
 - No conditional / logpoint / function breakpoints, and existing hand-made breakpoints are not preserved.
 

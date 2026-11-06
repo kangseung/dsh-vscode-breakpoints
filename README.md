@@ -82,7 +82,7 @@ npm install github:kangseung/dsh-vscode-breakpoints
 ## 已知限制
 
 - `debug.breakpoint` / `__$__targetStorageMarker` 不是公开 API，VS Code 大版本升级可能改格式；`action=list` 读不出来时会明确报错而不是猜。
-- Windows 上无法判断编辑器是否在运行（没有 `pgrep`），会退化为「不结束进程、直接写库」，此时需要你自己保证编辑器已关闭。
+- Windows 上无法判断编辑器是否在运行（没有 `pgrep`）：此时工具会直接报错让你带上 `restart=false`，而不是盲写——因为写进去的断点会被运行中的编辑器覆盖。
 - 只支持单根工作区和 `.code-workspace` 多根里包含当前项目的场景。
 - 不做条件断点、日志断点、函数断点，也不保留原有断点。
 

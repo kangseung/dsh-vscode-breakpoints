@@ -146,7 +146,14 @@ async function main() {
   buildFixtures()
   buildStorage()
 
-  const { apply } = await import('../index.js')
+  const { apply, EDITOR_PATTERN } = await import('../index.js')
+
+  // 8 之前在这里翻过车：pgrep -f 用 POSIX ERE，不支持 (?:...)，写错时会一个进程
+  // 也匹配不到，于是「编辑器明明开着」被误判成没开，写进库的断点随即被覆盖。
+  const probe = spawnSync('pgrep', ['-f', EDITOR_PATTERN], { encoding: 'utf8' })
+  assert.notEqual(probe.status, 2, `默认编辑器正则必须是 pgrep 能接受的 ERE（stderr: ${probe.stderr}）`)
+  assert.equal(probe.error, undefined)
+  console.log('0 editor pattern     ok')
   const { ctx, registered, config } = fakeContext({
     base: 'master',
     editorPattern: fakeEditorMarker,
