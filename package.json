@@ -1,0 +1,50 @@
+{
+  "name": "dsh-vscode-breakpoints",
+  "version": "0.1.0",
+  "description": "DeepSeek Harness plugin: put VS Code breakpoints on every block your branch changed against a base revision, then restart the editor so they take effect.",
+  "author": "kangseung",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kangseung/dsh-vscode-breakpoints.git"
+  },
+  "homepage": "https://github.com/kangseung/dsh-vscode-breakpoints#readme",
+  "bugs": {
+    "url": "https://github.com/kangseung/dsh-vscode-breakpoints/issues"
+  },
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "lib/apply.mjs",
+    "cordis.patch.yml",
+    "README.md",
+    "README.en.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node test/selftest.mjs"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "cordis",
+    "plugin",
+    "vscode",
+    "breakpoints",
+    "debugging",
+    "git-diff"
+  ],
+  "engines": {
+    "node": ">=22.5"
+  },
+  "license": "MIT",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

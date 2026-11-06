@@ -1,0 +1,6 @@
+# dsh-vscode-breakpoints bundle patch: mount the Host plugin under its package
+# name, resolved through the profile's node_modules.
+- insert:
+    - id: dsh-vscode-breakpoints
+      name: dsh-vscode-breakpoints
+      config: {}

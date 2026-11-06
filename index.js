@@ -1,0 +1,669 @@
+/**
+ * dsh-vscode-breakpoints — put VS Code breakpoints on every block this branch
+ * changed against a base revision, for the workspace that is already open.
+ *
+ * Why it restarts the editor: breakpoints live in the workspace-state SQLite
+ * database (`state.vscdb`, key `debug.breakpoint`) and VS Code only reads it at
+ * startup. Writing while it runs is pointless — the in-memory state wins on exit
+ * — so the flow is: terminate the editor, write the database, relaunch the same
+ * windows. That whole sequence runs in a detached helper (`lib/apply.mjs`) so it
+ * still finishes even if the agent that spawned it is restarted with the editor.
+ *
+ * No npm dependencies: Node built-ins plus the Host services `tools` and
+ * `subprocess`.
+ */
+import { spawn, spawnSync } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
+import { existsSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
+import { createRequire } from 'node:module'
+import { homedir, tmpdir } from 'node:os'
+import { extname, isAbsolute, join, resolve } from 'node:path'
+import { fileURLToPath, pathToFileURL } from 'node:url'
+
+export const name = 'dsh-vscode-breakpoints'
+export const inject = ['tools', 'subprocess']
+
+const HELPER = fileURLToPath(new URL('./lib/apply.mjs', import.meta.url))
+const require = createRequire(import.meta.url)
+
+/** Code files worth putting breakpoints in. */
+const CODE_EXTENSIONS = new Set([
+  '.py', '.pyi',
+  '.c', '.cc', '.cpp', '.cxx', '.h', '.hh', '.hpp', '.hxx', '.ipp',
+  '.js', '.jsx', '.mjs', '.cjs', '.ts', '.tsx',
+  '.go', '.rs', '.java', '.kt', '.cs', '.rb', '.php', '.sh', '.lua',
+])
+
+/** How to recognise the editor's own processes (never matches unrelated `code`). */
+const EDITOR_PATTERN =
+  '(?:/usr/share/code/code|/snap/code/|/opt/visual-studio-code|code-insiders|VSCodium|vscodium|/usr/share/code-insiders)'
+
+/** First line of a top-level block, used for files that are new in this branch. */
+const SEGMENT_RE = /^\s*(?:export\s+)?(?:async\s+def|def|class|function|func|struct|impl|namespace|template\s*<)\b/
+
+/**
+ * Fallback for new files that define no function or class at all (data modules,
+ * config tables): their top-level statements are the blocks worth stopping at.
+ */
+const TOP_LEVEL_STATEMENT_RE =
+  /^(?:assert\s|if\s|for\s|while\s|with\s|try\s*:|raise\s|return\s|[A-Za-z_][\w.]*\s*(?::[^=]+)?=(?!=))/
+
+const COMMENT_PREFIXES = ['#', '//', '/*', '*', '--']
+const DEFAULT_TIMEOUT_MS = 20000
+const STATUS_POLL_MS = 250
+
+let sqliteCtor = null
+
+function databaseSync() {
+  if (sqliteCtor === null) {
+    try {
+      sqliteCtor = require('node:sqlite').DatabaseSync
+    } catch (error) {
+      throw new Error(
+        'vscode_breakpoints: this Node runtime has no usable node:sqlite module (Node 22.5+ is required): ' +
+          `${error.message}`,
+      )
+    }
+  }
+  return sqliteCtor
+}
+
+const PARAMETERS = {
+  type: 'object',
+  properties: {
+    action: {
+      type: 'string',
+      enum: ['set', 'list', 'clear'],
+      description:
+        'set (default) replaces every breakpoint in this workspace with one per changed block; list reports what is there now; clear removes them all.',
+    },
+    base: {
+      type: 'string',
+      description: "Git revision to diff against. Defaults to the plugin config's base, else 'master'.",
+    },
+    cwd: {
+      type: 'string',
+      description: 'Project directory. Absolute, or relative to the session working directory.',
+    },
+    includeUntracked: {
+      type: 'boolean',
+      description: 'Also mark files that are new in this branch (one breakpoint per top-level block). Defaults to true.',
+    },
+    exclude: {
+      type: 'array',
+      items: { type: 'string' },
+      description: 'Path substrings to skip, e.g. ["migrations/", "third_party/"].',
+    },
+    restart: {
+      type: 'boolean',
+      description:
+        'Terminate the running editor, apply, then relaunch it with the same windows. Defaults to true; pass false when the editor is already closed.',
+    },
+    dryRun: {
+      type: 'boolean',
+      description: 'Compute and report the breakpoints without touching the editor or the database.',
+    },
+  },
+  additionalProperties: false,
+}
+
+const OUTPUT_SCHEMA = {
+  type: 'object',
+  properties: {
+    action: { type: 'string', enum: ['set', 'list', 'clear'] },
+    project: { type: 'string', description: 'Project directory the breakpoints belong to.' },
+    storage: { type: 'string', description: 'VS Code workspace-state directory that was used.' },
+    base: { type: 'string', description: 'Revision that was diffed against (empty for list/clear).' },
+    total: { type: 'number', description: 'How many breakpoints this run produced.' },
+    files: {
+      type: 'array',
+      description: 'Per-file breakpoint lines.',
+      items: {
+        type: 'object',
+        properties: {
+          file: { type: 'string' },
+          lines: { type: 'array', items: { type: 'number' } },
+        },
+        required: ['file', 'lines'],
+        additionalProperties: false,
+      },
+    },
+    applied: { type: 'boolean', description: 'Whether the database was actually written.' },
+    killed: { type: 'boolean', description: 'Whether a running editor was terminated.' },
+    relaunched: { type: 'number', description: 'How many editor windows were reopened.' },
+    dryRun: { type: 'boolean' },
+    backup: { type: 'string', description: 'Path of the state.vscdb backup taken before writing.' },
+    notes: { type: 'array', items: { type: 'string' }, description: 'Warnings and skipped files.' },
+  },
+  required: ['action', 'project', 'storage', 'base', 'total', 'files', 'applied', 'killed', 'relaunched', 'dryRun', 'backup', 'notes'],
+  additionalProperties: false,
+}
+
+function normalizeConfig(config) {
+  const raw = config ?? {}
+  if (typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new Error('dsh-vscode-breakpoints: config must be an object')
+  }
+  const base = raw.base ?? 'master'
+  if (typeof base !== 'string' || base.trim() === '') {
+    throw new Error('dsh-vscode-breakpoints: config.base must be a non-empty string')
+  }
+  // Overridable so unusual installs (and the self test) can point at their own
+  // editor process name instead of the default Code/Insiders/VSCodium set.
+  const editorPattern = raw.editorPattern ?? EDITOR_PATTERN
+  if (typeof editorPattern !== 'string' || editorPattern.trim() === '') {
+    throw new Error('dsh-vscode-breakpoints: config.editorPattern must be a non-empty string')
+  }
+  return { base: base.trim(), editorPattern: editorPattern.trim() }
+}
+
+function requireAction(args) {
+  const value = args?.action ?? 'set'
+  if (!['set', 'list', 'clear'].includes(value)) {
+    throw new Error(`vscode_breakpoints: "action" must be set, list or clear (got ${JSON.stringify(value)})`)
+  }
+  return value
+}
+
+function stringList(value) {
+  if (value === undefined) return []
+  if (!Array.isArray(value)) throw new Error('vscode_breakpoints: "exclude" must be an array of strings')
+  return value.map((item) => {
+    if (typeof item !== 'string') throw new Error('vscode_breakpoints: "exclude" must be an array of strings')
+    return item
+  })
+}
+
+// ---------------------------------------------------------------------------
+// git
+// ---------------------------------------------------------------------------
+
+async function runCapture(ctx, argv, cwd) {
+  const handle = ctx.subprocess.spawn({
+    argv,
+    cwd,
+    stdio: {
+      stdin: 'ignore',
+      stdout: { maxBytes: 64 * 1024 * 1024 },
+      stderr: { maxBytes: 1024 * 1024 },
+    },
+  })
+  const outcome = await handle.done
+  return {
+    exitCode: outcome.exitCode,
+    stdout: handle.collected.stdout?.readFrom(0)?.text ?? '',
+    stderr: handle.collected.stderr?.readFrom(0)?.text ?? '',
+  }
+}
+
+function git(ctx, cwd, args) {
+  return runCapture(ctx, ['git', '-C', cwd, '-c', 'core.quotePath=false', ...args], cwd)
+}
+
+async function gitOrThrow(ctx, cwd, args, hint) {
+  const result = await git(ctx, cwd, args)
+  if (result.exitCode !== 0) {
+    throw new Error(
+      `vscode_breakpoints: git ${args.join(' ')} failed in ${cwd}: ` +
+        `${result.stderr.trim() || `exit ${result.exitCode}`}` +
+        (hint === undefined ? '' : `\n${hint}`),
+    )
+  }
+  return result.stdout
+}
+
+async function resolveProject(ctx, exec, requested) {
+  if (requested !== undefined) {
+    const target = isAbsolute(requested) ? requested : resolve(process.cwd(), requested)
+    if (!existsSync(target)) throw new Error(`vscode_breakpoints: cwd "${target}" does not exist`)
+    return target
+  }
+  const workingDirectory = ctx.get('workingDirectory', false)
+  if (workingDirectory === undefined || exec.agent === undefined) {
+    throw new Error('vscode_breakpoints: cannot resolve the session working directory; pass `cwd` explicitly')
+  }
+  return await workingDirectory.ensure(exec.agent, exec.signal)
+}
+
+// ---------------------------------------------------------------------------
+// Workspace state discovery
+// ---------------------------------------------------------------------------
+
+function candidateUserDirs() {
+  const home = homedir()
+  const apps = ['Code', 'Code - OSS', 'Code - Insiders', 'VSCodium']
+  const dirs = []
+  if (process.platform === 'darwin') {
+    for (const app of apps) dirs.push(join(home, 'Library', 'Application Support', app, 'User'))
+  } else if (process.platform === 'win32') {
+    const appData = process.env.APPDATA ?? join(home, 'AppData', 'Roaming')
+    for (const app of apps) dirs.push(join(appData, app, 'User'))
+  } else {
+    for (const app of apps) {
+      dirs.push(join(home, '.config', app, 'User'))
+      dirs.push(join(home, '.var', 'app', app, 'config', app, 'User')) // flatpak
+    }
+  }
+  return dirs.filter((dir) => existsSync(join(dir, 'workspaceStorage')))
+}
+
+/** Decode `file:///...` (or a plain path) into an absolute filesystem path. */
+function uriToPath(value) {
+  if (typeof value !== 'string' || value === '') return undefined
+  if (!value.startsWith('file://')) return value
+  try {
+    return fileURLToPath(value)
+  } catch {
+    return undefined
+  }
+}
+
+function workspaceMatches(entry, project) {
+  const folder = uriToPath(entry?.folder)
+  if (folder !== undefined && resolve(folder) === project) return true
+  const workspaceFile = uriToPath(entry?.workspace)
+  if (workspaceFile === undefined || !existsSync(workspaceFile)) return false
+  try {
+    const parsed = JSON.parse(readFileSync(workspaceFile, 'utf8'))
+    for (const item of Array.isArray(parsed.folders) ? parsed.folders : []) {
+      const raw = typeof item === 'string' ? item : item?.path
+      if (typeof raw !== 'string') continue
+      const abs = isAbsolute(raw) ? raw : resolve(workspaceFile, '..', raw)
+      if (resolve(abs) === project) return true
+    }
+  } catch {
+    return false
+  }
+  return false
+}
+
+function findWorkspaceStorage(project) {
+  const searched = []
+  for (const userDir of candidateUserDirs()) {
+    const root = join(userDir, 'workspaceStorage')
+    searched.push(root)
+    for (const hash of readdirSync(root)) {
+      const entryPath = join(root, hash, 'workspace.json')
+      if (!existsSync(entryPath)) continue
+      let entry
+      try {
+        entry = JSON.parse(readFileSync(entryPath, 'utf8'))
+      } catch {
+        continue
+      }
+      if (!workspaceMatches(entry, project)) continue
+      return { dir: join(root, hash), db: join(root, hash, 'state.vscdb'), userDir }
+    }
+  }
+  throw new Error(
+    `vscode_breakpoints: no VS Code workspace matches ${project}. ` +
+      `Open that folder in VS Code at least once, then retry. Searched: ${searched.join(', ')}`,
+  )
+}
+
+function readBreakpoints(dbPath) {
+  if (!existsSync(dbPath)) return []
+  const DatabaseSync = databaseSync()
+  const db = new DatabaseSync(dbPath, { readOnly: true })
+  try {
+    const row = db.prepare("SELECT value FROM ItemTable WHERE key = 'debug.breakpoint'").get()
+    if (row === undefined || row.value === null) return []
+    const parsed = JSON.parse(String(row.value))
+    return Array.isArray(parsed) ? parsed : []
+  } finally {
+    db.close()
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Diff -> breakpoint lines
+// ---------------------------------------------------------------------------
+
+function isCodeFile(path) {
+  return CODE_EXTENSIONS.has(extname(path).toLowerCase())
+}
+
+/** One entry per hunk: `-U0` gives exactly one hunk per contiguous change. */
+function parseDiff(diffText) {
+  const plan = new Map()
+  let current = null
+  for (const line of diffText.split('\n')) {
+    if (line.startsWith('+++ ')) {
+      const marker = line.slice(4)
+      current = marker === '/dev/null' ? null : marker.replace(/^b\//, '')
+      continue
+    }
+    if (current === null || !line.startsWith('@@')) continue
+    const match = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/.exec(line)
+    if (match === null) continue
+    const start = Number(match[1])
+    const length = match[2] === undefined ? 1 : Number(match[2])
+    // A pure deletion has no new-side line: mark the line it collapsed to.
+    const target = length > 0 ? start : Math.max(start, 1)
+    if (!plan.has(current)) plan.set(current, new Set())
+    plan.get(current).add(target)
+  }
+  return plan
+}
+
+/** Move onto the next line that can actually hold a breakpoint. */
+function advanceToCode(lines, line) {
+  for (let index = line; index <= lines.length; index += 1) {
+    const text = lines[index - 1].trim()
+    if (text === '') continue
+    if (COMMENT_PREFIXES.some((prefix) => text.startsWith(prefix))) continue
+    return index
+  }
+  return line
+}
+
+function segmentStarts(lines) {
+  const starts = []
+  lines.forEach((text, index) => {
+    if (SEGMENT_RE.test(text)) starts.push(index + 1)
+  })
+  if (starts.length > 0) return starts
+  lines.forEach((text, index) => {
+    if (TOP_LEVEL_STATEMENT_RE.test(text)) starts.push(index + 1)
+  })
+  return starts
+}
+
+/** absolute path -> Set<line> */
+async function buildPlan(ctx, project, base, includeUntracked, exclude, notes) {
+  const root = (
+    await gitOrThrow(ctx, project, ['rev-parse', '--show-toplevel'], 'Run the tool inside a git repository.')
+  ).trim()
+
+  const verify = await git(ctx, project, ['rev-parse', '--verify', '--quiet', `${base}^{commit}`])
+  if (verify.exitCode !== 0) {
+    throw new Error(
+      `vscode_breakpoints: base revision "${base}" does not exist in ${root}. ` +
+        'Pass base="<branch-or-sha>" (for example "origin/main" or "HEAD~1").',
+    )
+  }
+
+  const diffText = await gitOrThrow(ctx, project, ['diff', base, '--unified=0', '--no-color'])
+  const plan = new Map()
+  const skipped = []
+  for (const [relPath, lines] of parseDiff(diffText)) {
+    if (!isCodeFile(relPath)) {
+      skipped.push(relPath)
+      continue
+    }
+    if (exclude.some((needle) => relPath.includes(needle))) continue
+    const absPath = resolve(root, relPath)
+    if (!existsSync(absPath)) continue
+    const source = readFileSync(absPath, 'utf8').split('\n')
+    const resolved = new Set()
+    for (const line of lines) resolved.add(advanceToCode(source, line))
+    plan.set(absPath, resolved)
+  }
+  if (skipped.length > 0) notes.push(`跳过 ${skipped.length} 个非代码文件: ${skipped.slice(0, 5).join(', ')}`)
+
+  if (includeUntracked) {
+    const untracked = await gitOrThrow(ctx, project, ['ls-files', '--others', '--exclude-standard'])
+    for (const relPath of untracked.split('\n').map((line) => line.trim()).filter((line) => line !== '')) {
+      if (!isCodeFile(relPath)) continue
+      if (exclude.some((needle) => relPath.includes(needle))) continue
+      const absPath = resolve(root, relPath)
+      if (!existsSync(absPath)) continue
+      const starts = segmentStarts(readFileSync(absPath, 'utf8').split('\n'))
+      if (starts.length === 0) {
+        notes.push(`新文件里没有可识别的代码块起点，跳过: ${relPath}`)
+        continue
+      }
+      plan.set(absPath, new Set(starts))
+    }
+  }
+
+  return { root, plan }
+}
+
+function toBreakpoints(plan) {
+  const entries = []
+  for (const [absPath, lines] of plan) {
+    for (const line of [...lines].sort((left, right) => left - right)) {
+      entries.push({
+        id: randomUUID(),
+        enabled: true,
+        uri: {
+          $mid: 1,
+          fsPath: absPath,
+          external: pathToFileURL(absPath).href,
+          path: absPath,
+          scheme: 'file',
+        },
+        lineNumber: line,
+      })
+    }
+  }
+  return entries
+}
+
+// ---------------------------------------------------------------------------
+// Editor process handling
+// ---------------------------------------------------------------------------
+
+async function resolveEditorBin(ctx) {
+  for (const candidate of ['code', 'code-insiders', 'codium']) {
+    try {
+      return await ctx.subprocess.resolveExecutable(candidate)
+    } catch {
+      /* try the next one */
+    }
+  }
+  return undefined
+}
+
+/** true/false, or undefined when the platform cannot tell us. */
+function editorRunning(pattern) {
+  if (process.platform === 'win32') return undefined
+  const out = spawnSync('pgrep', ['-f', pattern], { encoding: 'utf8' })
+  if (out.error !== undefined || out.status === 127) return undefined
+  return out.status === 0
+}
+
+/** Windows that were open, so the relaunch puts the user back where they were. */
+function openWindowUris(userDir, project) {
+  const storagePath = join(userDir, 'globalStorage', 'storage.json')
+  const uris = []
+  if (existsSync(storagePath)) {
+    try {
+      const parsed = JSON.parse(readFileSync(storagePath, 'utf8'))
+      for (const item of parsed?.windowsState?.openedWindows ?? []) {
+        const value = item?.workspace ?? item?.folder
+        if (typeof value === 'string' && value !== '' && !uris.includes(value)) uris.push(value)
+      }
+    } catch {
+      /* fall back to the project directory below */
+    }
+  }
+  if (uris.length === 0) uris.push(pathToFileURL(project).href)
+  return uris
+}
+
+/** Run the detached helper and wait for its status file. */
+async function spawnHelper(payload) {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-breakpoints-'))
+  const payloadPath = join(dir, 'payload.json')
+  const statusPath = join(dir, 'status.json')
+  writeFileSync(payloadPath, JSON.stringify({ ...payload, statusPath }))
+  spawn(process.execPath, [HELPER, payloadPath], { detached: true, stdio: 'ignore' }).unref()
+
+  const sleep = (ms) => new Promise((done) => setTimeout(done, ms))
+  const deadline = Date.now() + (payload.timeoutMs ?? DEFAULT_TIMEOUT_MS) + 5000
+  while (Date.now() < deadline) {
+    if (existsSync(statusPath)) return JSON.parse(readFileSync(statusPath, 'utf8'))
+    await sleep(STATUS_POLL_MS)
+  }
+  return { ok: false, reason: `后台写入未在超时内完成，状态文件: ${statusPath}` }
+}
+
+// ---------------------------------------------------------------------------
+// Tool
+// ---------------------------------------------------------------------------
+
+function groupByFile(entries, root) {
+  const grouped = new Map()
+  for (const entry of entries) {
+    const fsPath = entry?.uri?.fsPath ?? '(unknown)'
+    const rel = fsPath.startsWith(`${root}/`) ? fsPath.slice(root.length + 1) : fsPath
+    if (!grouped.has(rel)) grouped.set(rel, [])
+    grouped.get(rel).push(entry.lineNumber)
+  }
+  return [...grouped].map(([file, lines]) => ({ file, lines: lines.sort((left, right) => left - right) }))
+}
+
+function renderResult(value) {
+  const facts = [`vscode · ${value.action}`, `${value.total} 个断点`]
+  if (value.killed) facts.push('已结束原窗口')
+  if (value.relaunched > 0) facts.push(`重开 ${value.relaunched} 个窗口`)
+  if (value.dryRun) facts.push('dry-run（未写入）')
+  const lines = [facts.join(' · ')]
+  for (const item of value.files) lines.push(`  ${item.file}: ${item.lines.join(', ')}`)
+  for (const note of value.notes) lines.push(`  ! ${note}`)
+  return lines.join('\n')
+}
+
+export function apply(ctx, config) {
+  const cfg = normalizeConfig(config)
+
+  ctx.effect(() =>
+    ctx.tools.register({
+      name: 'vscode_breakpoints',
+      description: [
+        'Set, list or clear VS Code breakpoints for the workspace of this project — the way to "给 diff 的每一处都打上断点" without clicking through the diff.',
+        'action=set diffs the working tree against `base` (default master) and puts one breakpoint on the first code line of every changed block;',
+        'files that are new in this branch get one breakpoint per top-level block.',
+        'By default the tool terminates the running editor, writes the workspace-state database and relaunches the same windows,',
+        'because VS Code reads breakpoints only at startup (unsaved buffers survive through hot exit).',
+        'Use dryRun=true to preview the list, restart=false when the editor is already closed.',
+      ].join(' '),
+      parameters: PARAMETERS,
+      output: {
+        schema: OUTPUT_SCHEMA,
+        render: (args, value) => [{ type: 'text', text: renderResult(value) }],
+      },
+      presentCall: (args) => ({
+        card: 'generic',
+        title: `vscode 断点 · ${args?.action ?? 'set'}`,
+        kind: 'execute',
+        rawInput: args,
+      }),
+      async execute(args, exec) {
+        const action = requireAction(args)
+        const project = await resolveProject(ctx, exec, args?.cwd)
+        const storage = findWorkspaceStorage(project)
+        const notes = []
+        const dryRun = args?.dryRun === true
+
+        if (action === 'list') {
+          const existing = readBreakpoints(storage.db)
+          return {
+            action,
+            project,
+            storage: storage.dir,
+            base: '',
+            total: existing.length,
+            files: groupByFile(existing, project),
+            applied: false,
+            killed: false,
+            relaunched: 0,
+            dryRun,
+            backup: '',
+            notes,
+          }
+        }
+
+        const base = action === 'set' ? (args?.base ?? cfg.base).trim() : ''
+        let entries = []
+        let root = project
+        if (action === 'set') {
+          const built = await buildPlan(
+            ctx,
+            project,
+            base,
+            args?.includeUntracked !== false,
+            stringList(args?.exclude),
+            notes,
+          )
+          root = built.root
+          entries = toBreakpoints(built.plan)
+          if (entries.length === 0) notes.push(`与 ${base} 相比没有需要打点的代码改动`)
+        }
+        const files = groupByFile(entries, root)
+
+        const running = editorRunning(cfg.editorPattern)
+        const restart = args?.restart !== false
+        if (running === true && !restart) {
+          throw new Error(
+            'vscode_breakpoints: VS Code is running and restart=false, so the write would be discarded when it exits. ' +
+              'Close the editor first, or leave restart at its default to let the tool restart it.',
+          )
+        }
+        if (running === true && restart && dryRun) {
+          notes.push('VS Code 正在运行：真正执行时会先结束它再重开')
+        }
+
+        if (dryRun) {
+          return {
+            action,
+            project,
+            storage: storage.dir,
+            base,
+            total: entries.length,
+            files,
+            applied: false,
+            killed: false,
+            relaunched: 0,
+            dryRun,
+            backup: '',
+            notes,
+          }
+        }
+
+        const bin = await resolveEditorBin(ctx)
+        const relaunch = []
+        if (running === true) {
+          if (bin === undefined) {
+            notes.push('找不到 code 可执行文件：只结束原窗口，需要你手动重新打开')
+          } else {
+            for (const uri of openWindowUris(storage.userDir, project)) relaunch.push([bin, uri])
+          }
+        }
+
+        const status = await spawnHelper({
+          db: storage.db,
+          pattern: cfg.editorPattern,
+          kill: restart,
+          breakpoints: entries,
+          relaunch,
+          timeoutMs: DEFAULT_TIMEOUT_MS,
+        })
+        if (status.ok !== true) {
+          throw new Error(
+            `vscode_breakpoints: 后台写入失败：${status.reason ?? '未知原因'}` +
+              (status.killed ? '\n编辑器进程可能已被结束，请手动重新打开。' : ''),
+          )
+        }
+        if (typeof status.reason === 'string' && status.reason !== '') notes.push(status.reason)
+
+        return {
+          action,
+          project,
+          storage: storage.dir,
+          base,
+          total: entries.length,
+          files,
+          applied: status.applied === true,
+          killed: status.killed === true,
+          relaunched: status.relaunched ?? 0,
+          dryRun: false,
+          backup: `${storage.db}.before-bp.bak`,
+          notes,
+        }
+      },
+    }),
+  )
+}
