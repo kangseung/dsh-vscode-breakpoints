@@ -54,7 +54,7 @@ Optional plugin config: `base`, and `editorPattern` (a custom regex to recognise
 1. `pgrep -f` finds the editor's process family, then the root of it (the Electron main process, i.e. the one whose parent is outside the family) gets `SIGTERM` — a normal shutdown, so unsaved buffers are kept by VS Code's hot exit.
 2. Wait for the processes to disappear (20s default). If they do not, nothing is written and the call fails loudly.
 3. Back up `state.vscdb` to `state.vscdb.before-bp.bak`, write `debug.breakpoint`, and register the key in `__$__targetStorageMarker` (VS Code deletes the key when the list becomes empty, so this uses `INSERT OR REPLACE`, not `UPDATE`).
-4. Reopen the windows listed in `globalStorage/storage.json` → `windowsState.openedWindows`; fall back to the project folder alone.
+4. Reopen the windows listed in `globalStorage/storage.json` → `windowsState.openedWindows` (falling back to `lastActiveWindow`): **folders through `code --folder-uri`, `.code-workspace` files through `code --file-uri`** — a bare `file://` URI makes VS Code open a text file named after the folder. With nothing recorded, only the project folder is reopened (also via `--folder-uri`).
 
 Steps 1–4 run in a **detached helper** (`lib/apply.mjs`), so if DSH itself runs in a VS Code terminal and dies with the editor, the write and relaunch still complete.
 

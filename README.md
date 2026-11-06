@@ -68,7 +68,7 @@ npm install github:kangseung/dsh-vscode-breakpoints
 1. 用 `pgrep -f` 找到编辑器进程家族，再挑出父进程不在家族里的那个（= Electron 主进程），对它发 `SIGTERM` —— 走正常退出路径，未保存的编辑器内容由 VS Code 的 hot exit 保下来。
 2. 等进程消失（默认最多 20s）。还没退干净就**不写库**，直接报错，避免被覆盖。
 3. 备份 `state.vscdb` → `state.vscdb.before-bp.bak`，写入 `debug.breakpoint`，并把该 key 登记进 `__$__targetStorageMarker`（VS Code 清空断点时会连 key 一起删掉，所以必须 `INSERT OR REPLACE` 而不是 `UPDATE`）。
-4. 从 `globalStorage/storage.json` 的 `windowsState.openedWindows` 读出原来开着哪些窗口，逐个 `code <uri>` 重开；读不到时退化为只重开当前项目目录。
+4. 从 `globalStorage/storage.json` 的 `windowsState.openedWindows`（空则退到 `lastActiveWindow`）读出原来开着哪些窗口，逐个重开：**文件夹窗口用 `code --folder-uri`，`.code-workspace` 用 `code --file-uri`**——裸 `file://` 会被 VS Code 当成一个同名文本文件打开。都读不到时只重开当前项目目录（同样带 `--folder-uri`）。
 
 第 1–4 步在**独立的后台进程**（`lib/apply.mjs`）里跑：即使 DSH 自己也跑在 VS Code 的终端里、跟着被结束，这批断点照样会写完并重开编辑器。
 

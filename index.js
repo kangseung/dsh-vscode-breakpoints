@@ -473,23 +473,71 @@ function editorRunning(pattern) {
   return undefined
 }
 
-/** Windows that were open, so the relaunch puts the user back where they were. */
-function openWindowUris(userDir, project) {
+/**
+ * Windows that were open, so the relaunch puts the user back where they were.
+ *
+ * Each entry is `{kind: 'folder' | 'workspace', uri}` and gets launched through
+ * `--folder-uri` / `--file-uri`. Passing a bare `file:///.../project` without the
+ * flag makes VS Code open it as a *text file* named like the folder, which is
+ * exactly the bug this shape prevents.
+ */
+function collectWindows(userDir, project) {
+  const found = []
+  const add = (kind, uri) => {
+    if (typeof uri !== 'string' || uri === '') return
+    if (found.some((item) => item.uri === uri)) return
+    found.push({ kind, uri })
+  }
+  const asUri = (value) => {
+    if (typeof value === 'string') return value
+    if (value !== null && typeof value === 'object') {
+      if (typeof value.external === 'string') return value.external
+      if (typeof value.fsPath === 'string') return pathToFileURL(value.fsPath).href
+    }
+    return undefined
+  }
+
   const storagePath = join(userDir, 'globalStorage', 'storage.json')
-  const uris = []
   if (existsSync(storagePath)) {
+    let opened = []
     try {
       const parsed = JSON.parse(readFileSync(storagePath, 'utf8'))
-      for (const item of parsed?.windowsState?.openedWindows ?? []) {
-        const value = item?.workspace ?? item?.folder
-        if (typeof value === 'string' && value !== '' && !uris.includes(value)) uris.push(value)
+      const state = parsed?.windowsState ?? {}
+      opened = Array.isArray(state.openedWindows) ? [...state.openedWindows] : []
+      if (opened.length === 0 && state.lastActiveWindow !== null && state.lastActiveWindow !== undefined) {
+        opened = [state.lastActiveWindow]
       }
     } catch {
-      /* fall back to the project directory below */
+      opened = []
+    }
+    for (const item of opened) {
+      const configPath =
+        asUri(item?.workspace?.configPath) ??
+        asUri(item?.workspaceIdentifier?.configURIPath) ??
+        asUri(item?.workspace?.configURIPath)
+      if (configPath !== undefined) {
+        add('workspace', configPath)
+        continue
+      }
+      const rawWorkspace = asUri(item?.workspace)
+      if (rawWorkspace !== undefined) {
+        add(rawWorkspace.endsWith('.code-workspace') ? 'workspace' : 'folder', rawWorkspace)
+        continue
+      }
+      const folder = asUri(item?.folder) ?? asUri(item?.folderUri)
+      // A window started as `code <some file>` carries only a backupPath: it has
+      // no folder to restore, so it is deliberately skipped.
+      if (folder !== undefined) add('folder', folder)
     }
   }
-  if (uris.length === 0) uris.push(pathToFileURL(project).href)
-  return uris
+
+  if (found.length === 0) found.push({ kind: 'folder', uri: pathToFileURL(project).href })
+  return found
+}
+
+/** argv for the editor CLI: explicit flags remove the folder/file ambiguity. */
+function relaunchArgv(bin, window) {
+  return [bin, window.kind === 'workspace' ? '--file-uri' : '--folder-uri', window.uri]
 }
 
 /** Run the detached helper and wait for its status file. */
@@ -644,7 +692,9 @@ export function apply(ctx, config) {
           if (bin === undefined) {
             notes.push('找不到 code 可执行文件：只结束原窗口，需要你手动重新打开')
           } else {
-            for (const uri of openWindowUris(storage.userDir, project)) relaunch.push([bin, uri])
+            for (const window of collectWindows(storage.userDir, project)) {
+              relaunch.push(relaunchArgv(bin, window))
+            }
           }
         }
 

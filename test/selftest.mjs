@@ -80,11 +80,16 @@ function buildStorage() {
   db.close()
 
   mkdirSync(join(userDir, 'globalStorage'), { recursive: true })
+  const workspaceFile = join(sandbox, 'multi.code-workspace')
+  writeFileSync(workspaceFile, JSON.stringify({ folders: [{ path: repo }] }))
   writeFileSync(
     join(userDir, 'globalStorage', 'storage.json'),
     JSON.stringify({
       windowsState: {
-        openedWindows: [{ folder: `file://${repo}` }, { folder: 'file:///tmp/other-window' }],
+        openedWindows: [
+          { folder: `file://${repo}` },
+          { workspace: { configPath: `file://${workspaceFile}` } },
+        ],
       },
     }),
   )
@@ -217,7 +222,11 @@ async function main() {
   fake.kill('SIGKILL')
   const relaunched = readFileSync(relaunchLog, 'utf8').trim().split('\n')
   assert.equal(relaunched.length, 2)
+  // 裸 file:// 会让 VS Code 把文件夹当成同名的文本文件打开，所以必须带显式标志
+  assert.ok(relaunched[0].includes('--folder-uri'), `文件夹窗口要用 --folder-uri: ${relaunched[0]}`)
   assert.ok(relaunched[0].includes(repo), 'the project window must be reopened first')
+  assert.ok(relaunched[1].includes('--file-uri'), `多根工作区要用 --file-uri: ${relaunched[1]}`)
+  assert.ok(relaunched[1].includes('.code-workspace'), 'the workspace window must be reopened')
   console.log('5 restart + relaunch ok  (%d 个窗口)', relaunched.length)
 
   // 6. clear empties the list.
