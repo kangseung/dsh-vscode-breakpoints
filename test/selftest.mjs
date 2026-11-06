@@ -24,6 +24,12 @@ const fakeEditorMarker = 'dsh-bp-selftest-editor-marker'
 
 process.env.HOME = home
 
+const q = '"'.repeat(3)
+
+/** 三段引号拼出来，免得源码里再逃一层。 */
+const header = (date) => `${q}Module docstring.\n\nCopyright ${date}.\n${q}\nVALUE = 1\n`
+
+
 function git(args, options = {}) {
   const result = spawnSync('git', ['-C', repo, ...args], { encoding: 'utf8', ...options })
   if (result.status !== 0) throw new Error(`git ${args.join(' ')}: ${result.stderr}`)
@@ -42,6 +48,7 @@ function buildFixtures() {
   const tracked = Array.from({ length: 60 }, (_, index) => `line_${index + 1} = ${index + 1}`)
   writeFileSync(join(repo, 'trading.py'), `${tracked.join('\n')}\n`)
   writeFileSync(join(repo, 'notes.md'), '# readme\n')
+  writeFileSync(join(repo, 'doc_header.py'), header('2026-01-01'))
   git(['config', 'user.email', 'selftest@example.com'])
   git(['config', 'user.name', 'selftest'])
   git(['add', '-A'])
@@ -58,6 +65,8 @@ function buildFixtures() {
   writeFileSync(join(repo, 'new_module.py'), 'def alpha():\n    return 1\n\n\nclass Beta:\n    pass\n')
   // A new file with no function or class: the top-level statements are the blocks.
   writeFileSync(join(repo, 'settings_table.py'), 'policy_a = ["x"]\nweight_a = {"x": 1.0}\n')
+  // 只改文件头 docstring 里的一行：这种改动不该产生断点
+  writeFileSync(join(repo, 'doc_header.py'), header('2026-02-02'))
   writeFileSync(join(repo, 'scratch.log'), 'not code\n')
 }
 
@@ -198,6 +207,12 @@ async function main() {
     'the modified file and both kinds of new file must be covered',
   )
   console.log('3 list               ok  (%s)', listed.files.map((item) => `${item.file}:${item.lines.length}`).join(', '))
+  // 断点必须落在真正会执行的行上：不进函数定义行，也不进注释/文档串。
+  const byFile = (name) => (listed.files.find((item) => item.file === name) ?? { lines: [] }).lines
+  assert.deepEqual(byFile('trading.py'), [10, 32], `改动行与新增函数的函数体首行: ${byFile('trading.py')}`)
+  assert.deepEqual(byFile('new_module.py'), [2, 6], `def/class 要进到函数体第一行: ${byFile('new_module.py')}`)
+  assert.deepEqual(byFile('doc_header.py'), [], '只改文档串的 hunk 必须整块丢弃')
+  console.log('3b 落点             ok  trading.py=%s new_module.py=%s doc_header.py=%s', JSON.stringify(byFile('trading.py')), JSON.stringify(byFile('new_module.py')), JSON.stringify(byFile('doc_header.py')))
 
   // 4. the marker key is registered alongside the existing one.
   const db = new DatabaseSync(dbPath, { readOnly: true })

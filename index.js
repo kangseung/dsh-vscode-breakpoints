@@ -41,8 +41,14 @@ const CODE_EXTENSIONS = new Set([
 export const EDITOR_PATTERN =
   '/usr/share/code/code|/snap/code/|/opt/visual-studio-code|/usr/share/code-insiders|code-insiders|VSCodium|vscodium'
 
-/** First line of a top-level block, used for files that are new in this branch. */
-const SEGMENT_RE = /^\s*(?:export\s+)?(?:async\s+def|def|class|function|func|struct|impl|namespace|template\s*<)\b/
+/**
+ * First line of a top-level block (new files only). Never used as a breakpoint
+ * line itself — resolveLine() steps into the body.
+ */
+const BLOCK_OPENER_RE =
+  /^(?:export\s+)?(?:default\s+)?(?:async\s+)?(?:def|function|func|class|struct|impl|namespace|template|interface)\b/
+
+const DOCSTRING_PREFIXES = ['"""', "'''", 'r"""', "r'''", 'R"""', "R'''"]
 
 /**
  * Fallback for new files that define no function or class at all (data modules,
@@ -326,7 +332,11 @@ function isCodeFile(path) {
   return CODE_EXTENSIONS.has(extname(path).toLowerCase())
 }
 
-/** One entry per hunk: `-U0` gives exactly one hunk per contiguous change. */
+/**
+ * One entry per hunk: `-U0` gives exactly one hunk per contiguous change.
+ * The hunk keeps its new-side range so the caller can tell whether *any* of the
+ * added lines can hold a breakpoint (a changed comment block cannot).
+ */
 function parseDiff(diffText) {
   const plan = new Map()
   let current = null
@@ -341,35 +351,126 @@ function parseDiff(diffText) {
     if (match === null) continue
     const start = Number(match[1])
     const length = match[2] === undefined ? 1 : Number(match[2])
+    if (!plan.has(current)) plan.set(current, [])
     // A pure deletion has no new-side line: mark the line it collapsed to.
-    const target = length > 0 ? start : Math.max(start, 1)
-    if (!plan.has(current)) plan.set(current, new Set())
-    plan.get(current).add(target)
+    plan.get(current).push({ start: Math.max(start, 1), length })
   }
   return plan
 }
 
-/** Move onto the next line that can actually hold a breakpoint. */
-function advanceToCode(lines, line) {
-  for (let index = line; index <= lines.length; index += 1) {
-    const text = lines[index - 1].trim()
-    if (text === '') continue
-    if (COMMENT_PREFIXES.some((prefix) => text.startsWith(prefix))) continue
-    return index
-  }
-  return line
+/**
+ * Lines that lie entirely inside a multi-line string / block comment. A diff
+ * hunk can land on a file header docstring, which never runs.
+ */
+function blockLineFlags(lines, path) {
+  const flags = new Array(lines.length).fill(false)
+  const isPython = ['.py', '.pyi'].includes(extname(path).toLowerCase())
+  const triples = ['"""', "'''"]
+  let pyOpen = null
+  let cOpen = false
+  lines.forEach((text, index) => {
+    if (isPython) {
+      if (pyOpen === null) {
+        let opened = null
+        let offset = -1
+        for (const token of triples) {
+          const at = text.indexOf(token)
+          if (at >= 0 && (offset < 0 || at < offset)) {
+            offset = at
+            opened = token
+          }
+        }
+        // `"""..."""` on a single line is a complete expression, not a block.
+        if (opened !== null && text.indexOf(opened, offset + 3) < 0) pyOpen = opened
+        flags[index] = false
+      } else {
+        flags[index] = true
+        if (text.indexOf(pyOpen) >= 0) pyOpen = null
+      }
+      return
+    }
+    if (cOpen) {
+      flags[index] = true
+      if (text.indexOf('*/') >= 0) cOpen = false
+      return
+    }
+    const open = text.indexOf('/*')
+    if (open >= 0 && text.indexOf('*/', open + 2) < 0) cOpen = true
+    flags[index] = false
+  })
+  return flags
 }
 
-function segmentStarts(lines) {
-  const starts = []
+function indentOf(text) {
+  return text.length - text.trimStart().length
+}
+
+/**
+ * A line can carry a breakpoint only if the interpreter would actually run it:
+ * not blank, not a comment, not inside a docstring / block comment, not a
+ * decorator, and not the `def` / `class` line itself — that line only runs the
+ * declaration, so stopping on it happens before the body ever executes.
+ */
+function skippable(text, inBlock) {
+  if (inBlock) return true
+  const trimmed = text.trim()
+  if (trimmed === '') return true
+  if (COMMENT_PREFIXES.some((prefix) => trimmed.startsWith(prefix))) return true
+  if (DOCSTRING_PREFIXES.some((prefix) => trimmed.startsWith(prefix))) return true
+  if (trimmed.startsWith('@')) return true
+  return false
+}
+
+/** Next runnable line at or after `line`; walks backwards past a trailing comment. */
+function nextRunnable(lines, flags, line) {
+  for (let index = Math.max(line, 1); index <= lines.length; index += 1) {
+    if (!skippable(lines[index - 1], flags[index - 1])) return index
+  }
+  for (let index = Math.min(line - 1, lines.length); index >= 1; index -= 1) {
+    if (!skippable(lines[index - 1], flags[index - 1])) return index
+  }
+  return null
+}
+
+/**
+ * Resolve a changed line into the line the breakpoint should sit on. When the
+ * change *is* a new function or class, step into its body — the first line that
+ * actually runs — instead of the declaration line.
+ */
+function resolveLine(lines, flags, line) {
+  let resolved = nextRunnable(lines, flags, line)
+  for (let guard = 0; resolved !== null && guard < 32; guard += 1) {
+    const text = lines[resolved - 1]
+    if (!BLOCK_OPENER_RE.test(text.trim())) break
+    const bodyLine = nextRunnable(lines, flags, resolved + 1)
+    if (bodyLine === null || indentOf(lines[bodyLine - 1]) <= indentOf(text)) break
+    resolved = bodyLine
+  }
+  return resolved
+}
+
+/**
+ * Start lines of every top-level block, for files that are new in this branch.
+ * Returned values are already resolved to runnable body lines.
+ */
+function segmentStarts(lines, flags) {
+  const openers = []
   lines.forEach((text, index) => {
-    if (SEGMENT_RE.test(text)) starts.push(index + 1)
+    if (BLOCK_OPENER_RE.test(text.trim())) openers.push(index + 1)
   })
-  if (starts.length > 0) return starts
-  lines.forEach((text, index) => {
-    if (TOP_LEVEL_STATEMENT_RE.test(text)) starts.push(index + 1)
-  })
-  return starts
+  if (openers.length === 0) {
+    // Data/config modules without any function: their top-level statements are
+    // the only blocks worth stopping at.
+    lines.forEach((text, index) => {
+      if (TOP_LEVEL_STATEMENT_RE.test(text)) openers.push(index + 1)
+    })
+  }
+  const resolved = new Set()
+  for (const line of openers) {
+    const target = resolveLine(lines, flags, line)
+    if (target !== null) resolved.add(target)
+  }
+  return [...resolved].sort((left, right) => left - right)
 }
 
 /** absolute path -> Set<line> */
@@ -389,7 +490,8 @@ async function buildPlan(ctx, project, base, includeUntracked, exclude, notes) {
   const diffText = await gitOrThrow(ctx, project, ['diff', base, '--unified=0', '--no-color'])
   const plan = new Map()
   const skipped = []
-  for (const [relPath, lines] of parseDiff(diffText)) {
+  let dropped = 0
+  for (const [relPath, hunks] of parseDiff(diffText)) {
     if (!isCodeFile(relPath)) {
       skipped.push(relPath)
       continue
@@ -398,10 +500,26 @@ async function buildPlan(ctx, project, base, includeUntracked, exclude, notes) {
     const absPath = resolve(root, relPath)
     if (!existsSync(absPath)) continue
     const source = readFileSync(absPath, 'utf8').split('\n')
+    const flags = blockLineFlags(source, absPath)
     const resolved = new Set()
-    for (const line of lines) resolved.add(advanceToCode(source, line))
+    for (const hunk of hunks) {
+      const added = []
+      for (let index = hunk.start; index < hunk.start + Math.max(hunk.length, 1); index += 1) {
+        if (index <= source.length) added.push(index)
+      }
+      // 整块都是注释/文档串（例如只改了文件头的时间戳）→ 打点没有意义
+      const anchor = added.find((index) => !skippable(source[index - 1], flags[index - 1]))
+      if (anchor === undefined) {
+        dropped += 1
+        continue
+      }
+      const target = resolveLine(source, flags, anchor)
+      if (target !== null) resolved.add(target)
+    }
+    if (resolved.size === 0) continue
     plan.set(absPath, resolved)
   }
+  if (dropped > 0) notes.push(`跳过 ${dropped} 处只有注释/文档串改动的 hunk`)
   if (skipped.length > 0) notes.push(`跳过 ${skipped.length} 个非代码文件: ${skipped.slice(0, 5).join(', ')}`)
 
   if (includeUntracked) {
@@ -411,7 +529,8 @@ async function buildPlan(ctx, project, base, includeUntracked, exclude, notes) {
       if (exclude.some((needle) => relPath.includes(needle))) continue
       const absPath = resolve(root, relPath)
       if (!existsSync(absPath)) continue
-      const starts = segmentStarts(readFileSync(absPath, 'utf8').split('\n'))
+      const source = readFileSync(absPath, 'utf8').split('\n')
+      const starts = segmentStarts(source, blockLineFlags(source, absPath))
       if (starts.length === 0) {
         notes.push(`新文件里没有可识别的代码块起点，跳过: ${relPath}`)
         continue

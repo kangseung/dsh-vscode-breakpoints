@@ -41,11 +41,12 @@ Optional plugin config: `base`, and `editorPattern` (a custom regex to recognise
 
 ## How the breakpoints are chosen
 
-1. `git diff <base> --unified=0`, one breakpoint per hunk at the first added line (for pure deletions, the line the removal collapsed to).
-2. Lines that are blank or a comment (`#`, `//`, `/*`, `*`, `--`) move down to the next executable line.
-3. Lines inside multi-line literals are left for the debugger to snap to the statement start when the session starts.
-4. Files new in this branch: one breakpoint per top-level `def` / `class` / `async def` / `function` / `func` / `struct` / `impl` / `namespace` line; a file with neither functions nor classes (pure data/config modules) falls back to one breakpoint per top-level assignment / `if` / `assert` statement.
-5. Only code extensions are considered; documentation, JSON and ignore files are skipped and reported.
+1. `git diff <base> --unified=0`; each hunk contributes only its **added** lines (a pure deletion contributes the line it collapsed to).
+2. Blank lines, comments, decorators (`@`), and anything inside a multi-line string or block comment (`"""..."""`, `/* ... */`) are skipped — those lines never run, so stopping there is pointless.
+3. When a whole added block is a comment or docstring (the usual case: a file-header timestamp changed), the hunk is dropped instead of snapping to some far-away line.
+4. A change on a `def` / `class` declaration **steps into the body** and stops on the first statement that actually runs (docstring skipped): stopping on the declaration fires before the function is even entered.
+5. Files new in this branch: each top-level block is resolved the same way and gets one breakpoint; a file with neither functions nor classes (pure data/config) falls back to one breakpoint per top-level assignment / `if` / `assert`.
+6. Only code extensions are considered; documentation, JSON and ignore files are skipped and reported.
 
 `set` **replaces** the workspace's breakpoints; anything you added by hand is gone.
 
